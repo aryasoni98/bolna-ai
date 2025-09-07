@@ -1,0 +1,605 @@
+"""
+AssemblyAI Transcriber Implementation for Bolna.
+
+This module provides real-time speech-to-text transcription using AssemblyAI's
+streaming API. It supports both streaming and non-streaming modes, with
+comprehensive error handling and multi-provider compatibility.
+
+Author: Bolna Integration Team
+License: MIT
+"""
+
+import asyncio
+import json
+import os
+import time
+import traceback
+from typing import Optional, Dict, Any, AsyncGenerator
+
+import aiohttp
+import websockets
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosedError, InvalidHandshake
+from dotenv import load_dotenv
+
+from bolna.helpers.logger_config import configure_logger
+from bolna.helpers.utils import create_ws_data_packet
+from .base_transcriber import BaseTranscriber
+
+logger = configure_logger(__name__)
+load_dotenv()
+
+
+class AssemblyAITranscriber(BaseTranscriber):
+    """
+    AssemblyAI transcriber implementation for real-time speech-to-text.
+
+    This class provides streaming transcription capabilities using AssemblyAI's
+    WebSocket API, with support for multiple telephony providers and comprehensive
+    error handling.
+
+    Attributes:
+        model: AssemblyAI model to use for transcription
+        language: Language code for transcription
+        stream: Whether to use streaming mode
+        provider: Telephony provider (twilio, exotel, plivo, etc.)
+        api_key: AssemblyAI API key
+        assemblyai_host: AssemblyAI API host
+    """
+
+    def __init__(
+        self,
+        telephony_provider: str,
+        input_queue: Optional[Any] = None,
+        model: str = 'best',
+        stream: bool = True,
+        language: str = "en",
+        sampling_rate: str = "16000",  # pylint: disable=unused-argument
+        encoding: str = "linear16",
+        output_queue: Optional[Any] = None,
+        keywords: Optional[str] = None,
+        process_interim_results: str = "true",
+        **kwargs
+    ):
+        """
+        Initialize AssemblyAI transcriber.
+
+        Args:
+            telephony_provider: The telephony provider being used
+            input_queue: Queue for incoming audio data
+            model: AssemblyAI model to use
+            stream: Whether to use streaming mode
+            language: Language code for transcription
+            sampling_rate: Audio sampling rate (unused but kept for compatibility)
+            encoding: Audio encoding format
+            output_queue: Queue for transcription output
+            keywords: Keywords to boost recognition
+            process_interim_results: Whether to process interim results
+            **kwargs: Additional configuration parameters
+        """
+        super().__init__(input_queue)
+
+        # Core configuration
+        self.language = language
+        self.stream = stream
+        self.provider = telephony_provider
+        self.model = model
+        self.sampling_rate = 16000
+        self.encoding = encoding
+
+        # API configuration
+        self.api_key = kwargs.get("transcriber_key", os.getenv('ASSEMBLYAI_API_KEY'))
+        self.assemblyai_host = os.getenv('ASSEMBLYAI_HOST', 'api.assemblyai.com')
+
+        # Queue and task management
+        self.transcriber_output_queue = output_queue
+        self.transcription_task = None
+        self.heartbeat_task = None
+        self.sender_task = None
+
+        # Audio processing
+        self.keywords = keywords
+        self.audio_cursor = 0.0
+        self.transcription_cursor = 0.0
+        self.audio_frame_duration = 0.0
+        self.num_frames = 0
+        self.connection_start_time = None
+
+        # State management
+        self.interruption_signalled = False
+        self.audio_submitted = False
+        self.audio_submission_time = None
+        self.process_interim_results = process_interim_results
+        self.connected_via_dashboard = kwargs.get("enforce_streaming", True)
+
+        # Message state
+        self.curr_message = ''
+        self.finalized_transcript = ""
+        self.final_transcript = ""
+        self.is_transcript_sent_for_processing = False
+
+        # Connection management
+        self.websocket_connection = None
+        self.connection_authenticated = False
+
+        # HTTP session for non-streaming mode
+        if not self.stream:
+            self.api_url = f"https://{self.assemblyai_host}/v2/transcript"
+            self.session = aiohttp.ClientSession()
+
+    def get_assemblyai_ws_url(self) -> str:
+        """
+        Generate WebSocket URL for AssemblyAI real-time streaming.
+
+        Returns:
+            WebSocket URL for AssemblyAI streaming API
+        """
+        ws_url = f"wss://{self.assemblyai_host}/v2/realtime/ws"
+
+        # Configure audio parameters based on provider
+        self._configure_audio_parameters()
+
+        return ws_url
+
+    def _configure_audio_parameters(self) -> None:
+        """Configure audio parameters based on telephony provider."""
+        if self.provider in ('twilio', 'exotel', 'plivo'):
+            self.encoding = 'mulaw' if self.provider == "twilio" else "linear16"
+            self.sampling_rate = 8000
+            self.audio_frame_duration = 0.2
+        elif self.provider == "web_based_call":
+            self.encoding = "linear16"
+            self.sampling_rate = 16000
+            self.audio_frame_duration = 0.256
+        elif not self.connected_via_dashboard:
+            self.encoding = "linear16"
+            self.sampling_rate = 16000
+            self.audio_frame_duration = 0.5
+
+        if self.provider == "playground":
+            self.sampling_rate = 8000
+            self.audio_frame_duration = 0.0
+
+    async def send_heartbeat(self, ws: ClientConnection) -> None:
+        """
+        Send periodic heartbeat to maintain WebSocket connection.
+
+        Args:
+            ws: WebSocket connection to send heartbeat to
+        """
+        try:
+            while True:
+                try:
+                    await ws.ping()
+                except ConnectionClosedError as exc:
+                    logger.info("Connection closed while sending ping: %s", exc)
+                    break
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.error("Error sending ping: %s", exc)
+                    break
+
+                await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            logger.info("Heartbeat task cancelled")
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error('Error in send_heartbeat: %s', exc)
+            raise
+
+    async def toggle_connection(self) -> None:
+        """Toggle connection state and cleanup resources."""
+        self.connection_on = False
+
+        if self.heartbeat_task is not None:
+            self.heartbeat_task.cancel()
+        if self.sender_task is not None:
+            self.sender_task.cancel()
+
+        if self.websocket_connection is not None:
+            try:
+                await self.websocket_connection.close()
+                logger.info("Websocket connection closed successfully")
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Error closing websocket connection: %s", exc)
+            finally:
+                self.websocket_connection = None
+                self.connection_authenticated = False
+
+    async def _get_http_transcription(self, audio_data: bytes) -> Optional[Dict[str, Any]]:
+        """
+        Perform HTTP-based transcription for non-streaming mode.
+
+        Args:
+            audio_data: Audio data to transcribe
+
+        Returns:
+            Transcription result or None if failed
+        """
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession()
+
+        headers = {
+            'Authorization': f'{self.api_key}',
+            'Content-Type': 'audio/wav'
+        }
+
+        self.current_request_id = self.generate_request_id()
+        self.meta_info['request_id'] = self.current_request_id
+        start_time = time.time()
+
+        try:
+            # Upload audio file
+            upload_url = f"https://{self.assemblyai_host}/v2/upload"
+            async with self.session.post(upload_url, data=audio_data, headers=headers) as upload_response:
+                if upload_response.status != 200:
+                    logger.error("Upload failed: %s", upload_response.status)
+                    return None
+                upload_data = await upload_response.json()
+                audio_url = upload_data['upload_url']
+
+            # Submit transcription job
+            transcript_data = {
+                'audio_url': audio_url,
+                'language_code': self.language,
+                'model': self.model
+            }
+
+            async with self.session.post(self.api_url, json=transcript_data, headers=headers) as response:
+                if response.status != 200:
+                    logger.error("Transcription submission failed: %s", response.status)
+                    return None
+                transcript_response = await response.json()
+                transcript_id = transcript_response['id']
+
+            # Poll for completion
+            return await self._poll_transcription_status(transcript_id, headers, start_time)
+
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Error in HTTP transcription: %s", exc)
+            return None
+
+    async def _poll_transcription_status(
+        self,
+        transcript_id: str,
+        headers: Dict[str, str],
+        start_time: float
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Poll for transcription completion status.
+
+        Args:
+            transcript_id: ID of the transcription job
+            headers: HTTP headers for requests
+            start_time: Start time of the transcription
+
+        Returns:
+            Transcription result or None if failed
+        """
+        while True:
+            try:
+                status_url = f"{self.api_url}/{transcript_id}"
+                async with self.session.get(status_url, headers=headers) as status_response:
+                    if status_response.status != 200:
+                        logger.error("Status check failed: %s", status_response.status)
+                        return None
+                    status_data = await status_response.json()
+
+                    if status_data['status'] == 'completed':
+                        transcript = status_data['text']
+                        self.meta_info["start_time"] = start_time
+                        self.meta_info['transcriber_latency'] = time.time() - start_time
+                        self.meta_info['transcriber_duration'] = status_data.get('audio_duration', 0)
+                        return create_ws_data_packet(transcript, self.meta_info)
+                    if status_data['status'] == 'error':
+                        error_msg = status_data.get('error', 'Unknown error')
+                        logger.error("Transcription failed: %s", error_msg)
+                        return None
+
+                    await asyncio.sleep(1)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Error polling transcription status: %s", exc)
+                return None
+
+    async def _check_and_process_end_of_stream(
+        self,
+        ws_data_packet: Dict[str, Any],
+        ws: ClientConnection
+    ) -> bool:
+        """
+        Check for end of stream signal and process accordingly.
+
+        Args:
+            ws_data_packet: WebSocket data packet
+            ws: WebSocket connection
+
+        Returns:
+            True if end of stream, False otherwise
+        """
+        if 'eos' in ws_data_packet['meta_info'] and ws_data_packet['meta_info']['eos'] is True:
+            await self._close(ws, data={"type": "CloseStream"})
+            return True
+        return False
+
+    def get_meta_info(self) -> Dict[str, Any]:
+        """Get metadata information for the transcriber."""
+        return self.meta_info
+
+    async def sender(self, ws: Optional[ClientConnection] = None) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Send audio data for HTTP-based transcription.
+
+        Args:
+            ws: WebSocket connection (unused in HTTP mode)
+
+        Yields:
+            Transcription results
+        """
+        try:
+            while True:
+                ws_data_packet = await self.input_queue.get()
+
+                if not self.audio_submitted:
+                    self.audio_submitted = True
+                    self.audio_submission_time = time.time()
+
+                end_of_stream = await self._check_and_process_end_of_stream(ws_data_packet, ws)
+                if end_of_stream:
+                    break
+
+                self.meta_info = ws_data_packet.get('meta_info')
+                start_time = time.time()
+                transcription = await self._get_http_transcription(ws_data_packet.get('data'))
+
+                if transcription:
+                    transcription['meta_info']["include_latency"] = True
+                    transcription['meta_info']["transcriber_latency"] = time.time() - start_time
+                    transcription['meta_info']['audio_duration'] = transcription['meta_info']['transcriber_duration']
+                    transcription['meta_info']['last_vocal_frame_timestamp'] = start_time
+                    yield transcription
+
+            if self.transcription_task is not None:
+                self.transcription_task.cancel()
+        except asyncio.CancelledError:
+            logger.info("Cancelled sender task")
+            return
+
+    async def sender_stream(self, ws: ClientConnection) -> None:
+        """
+        Send audio data via WebSocket for streaming transcription.
+
+        Args:
+            ws: WebSocket connection for streaming
+        """
+        try:
+            while True:
+                ws_data_packet = await self.input_queue.get()
+
+                if not self.audio_submitted:
+                    self.meta_info = ws_data_packet.get('meta_info')
+                    self.audio_submitted = True
+                    self.audio_submission_time = time.time()
+                    self.current_request_id = self.generate_request_id()
+                    self.meta_info['request_id'] = self.current_request_id
+
+                end_of_stream = await self._check_and_process_end_of_stream(ws_data_packet, ws)
+                if end_of_stream:
+                    break
+
+                self.num_frames += 1
+                self.audio_cursor = self.num_frames * self.audio_frame_duration
+
+                try:
+                    await ws.send(ws_data_packet.get('data'))
+                except ConnectionClosedError as exc:
+                    logger.error("Connection closed while sending data: %s", exc)
+                    break
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.error("Error sending data to websocket: %s", exc)
+                    break
+
+        except asyncio.CancelledError:
+            logger.info("Sender stream task cancelled")
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error('Error in sender_stream: %s', exc)
+            raise
+
+    async def receiver(self, ws: ClientConnection) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Receive transcription results from WebSocket.
+
+        Args:
+            ws: WebSocket connection
+
+        Yields:
+            Transcription results and status messages
+        """
+        async for msg in ws:
+            try:
+                msg = json.loads(msg)
+
+                if self.connection_start_time is None:
+                    self.connection_start_time = (time.time() - (self.num_frames * self.audio_frame_duration))
+
+                message_type = msg.get("message_type")
+
+                if message_type == "SessionBegins":
+                    logger.info("Received SessionBegins event from AssemblyAI")
+                    yield create_ws_data_packet("speech_started", self.meta_info)
+
+                elif message_type == "PartialTranscript":
+                    transcript = msg.get("text", "")
+                    if transcript.strip():
+                        data = {
+                            "type": "interim_transcript_received",
+                            "content": transcript
+                        }
+                        yield create_ws_data_packet(data, self.meta_info)
+
+                elif message_type == "FinalTranscript":
+                    transcript = msg.get("text", "")
+                    if transcript.strip():
+                        logger.info("Received final transcript - %s", transcript)
+                        data = {
+                            "type": "transcript",
+                            "content": transcript
+                        }
+                        yield create_ws_data_packet(data, self.meta_info)
+
+                elif message_type == "SessionTerminated":
+                    logger.info("Received SessionTerminated from AssemblyAI - %s", msg)
+                    yield create_ws_data_packet("transcriber_connection_closed", self.meta_info)
+                    return
+
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Error processing WebSocket message: %s", exc)
+                traceback.print_exc()
+                self.interruption_signalled = False
+
+    async def push_to_transcriber_queue(self, data_packet: Dict[str, Any]) -> None:
+        """
+        Push transcription result to output queue.
+
+        Args:
+            data_packet: Data packet to push to queue
+        """
+        await self.transcriber_output_queue.put(data_packet)
+
+    async def assemblyai_connect(self) -> ClientConnection:
+        """
+        Establish WebSocket connection to AssemblyAI.
+
+        Returns:
+            WebSocket connection
+
+        Raises:
+            ConnectionError: If connection fails
+        """
+        try:
+            websocket_url = self.get_assemblyai_ws_url()
+            additional_headers = {
+                'Authorization': f'{self.api_key}'
+            }
+
+            logger.info("Attempting to connect to AssemblyAI websocket: %s", websocket_url)
+
+            assemblyai_ws = await asyncio.wait_for(
+                websockets.connect(websocket_url, additional_headers=additional_headers),
+                timeout=10.0
+            )
+
+            self.websocket_connection = assemblyai_ws
+            self.connection_authenticated = True
+            logger.info("Successfully connected to AssemblyAI websocket")
+
+            return assemblyai_ws
+
+        except asyncio.TimeoutError as exc:
+            logger.error("Timeout while connecting to AssemblyAI websocket")
+            raise ConnectionError("Timeout while connecting to AssemblyAI websocket") from exc
+        except InvalidHandshake as exc:
+            logger.error("Invalid handshake during AssemblyAI websocket connection: %s", exc)
+            raise ConnectionError(f"Invalid handshake during AssemblyAI websocket connection: {exc}") from exc
+        except ConnectionClosedError as exc:
+            logger.error("AssemblyAI websocket connection closed unexpectedly: %s", exc)
+            raise ConnectionError(f"AssemblyAI websocket connection closed unexpectedly: {exc}") from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Unexpected error connecting to AssemblyAI websocket: %s", exc)
+            raise ConnectionError(f"Unexpected error connecting to AssemblyAI websocket: {exc}") from exc
+
+    async def run(self) -> None:
+        """Start the transcription task."""
+        try:
+            self.transcription_task = asyncio.create_task(self.transcribe())
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Error starting transcription task: %s", exc)
+
+    async def transcribe(self) -> None:
+        """
+        Main transcription method handling both streaming and non-streaming modes.
+
+        This method manages the entire transcription lifecycle including connection
+        establishment, audio streaming, result processing, and cleanup.
+        """
+        assemblyai_ws = None
+        try:
+            start_time = time.perf_counter()
+
+            try:
+                assemblyai_ws = await self.assemblyai_connect()
+            except (ValueError, ConnectionError) as exc:
+                logger.error("Failed to establish AssemblyAI connection: %s", exc)
+                await self.toggle_connection()
+                return
+
+            if not self.connection_time:
+                self.connection_time = round((time.perf_counter() - start_time) * 1000)
+
+            if self.stream:
+                await self._handle_streaming_mode(assemblyai_ws)
+            else:
+                await self._handle_non_streaming_mode()
+
+        except (ValueError, ConnectionError) as exc:
+            logger.error("Connection error in transcribe: %s", exc)
+            await self.toggle_connection()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Unexpected error in transcribe: %s", exc)
+            await self.toggle_connection()
+        finally:
+            await self._cleanup_connection(assemblyai_ws)
+
+    async def _handle_streaming_mode(self, assemblyai_ws: ClientConnection) -> None:
+        """
+        Handle streaming transcription mode.
+
+        Args:
+            assemblyai_ws: WebSocket connection for streaming
+        """
+        self.sender_task = asyncio.create_task(self.sender_stream(assemblyai_ws))
+        self.heartbeat_task = asyncio.create_task(self.send_heartbeat(assemblyai_ws))
+
+        try:
+            async for message in self.receiver(assemblyai_ws):
+                if self.connection_on:
+                    await self.push_to_transcriber_queue(message)
+                else:
+                    logger.info("closing the assemblyai connection")
+                    await self._close(assemblyai_ws, data={"type": "CloseStream"})
+                    break
+        except ConnectionClosedError as exc:
+            logger.error("AssemblyAI websocket connection closed during streaming: %s", exc)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Error during streaming: %s", exc)
+            raise
+
+    async def _handle_non_streaming_mode(self) -> None:
+        """Handle non-streaming transcription mode."""
+        async for message in self.sender():
+            await self.push_to_transcriber_queue(message)
+
+    async def _cleanup_connection(self, assemblyai_ws: Optional[ClientConnection]) -> None:
+        """
+        Clean up WebSocket connection and tasks.
+
+        Args:
+            assemblyai_ws: WebSocket connection to clean up
+        """
+        if assemblyai_ws is not None:
+            try:
+                await assemblyai_ws.close()
+                logger.info("AssemblyAI websocket closed in finally block")
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Error closing websocket in finally block: %s", exc)
+            finally:
+                self.websocket_connection = None
+                self.connection_authenticated = False
+
+        if hasattr(self, 'sender_task') and self.sender_task is not None:
+            self.sender_task.cancel()
+        if hasattr(self, 'heartbeat_task') and self.heartbeat_task is not None:
+            self.heartbeat_task.cancel()
+
+        await self.push_to_transcriber_queue(
+            create_ws_data_packet("transcriber_connection_closed", getattr(self, 'meta_info', {}))
+        )
